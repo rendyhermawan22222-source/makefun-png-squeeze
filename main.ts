@@ -12,18 +12,23 @@
 //      (type 6) otherwise; a single fully transparent value, when no opaque
 //      pixel shares it, is carried by a tRNS key instead of an alpha channel.
 //   3. Filter each row: fixed filter 0, and per-row choices by the
-//      minimum-sum heuristic (PNG spec 12.8), fewest distinct byte pairs,
-//      and brute force (each filter tried through zlib at level 4 after the
-//      32 KiB written before it). The winner is screened by zlib at level
-//      6: the cheap proxies mislead, because the signed sum and a level-1
-//      deflate both favour small filtered values over the exact repetition
-//      an unfiltered row keeps and level 6 squeezes hardest.
+//      minimum-sum heuristic (PNG spec 12.8) and fewest distinct byte
+//      pairs, plus brute force (each filter tried through zlib at level 4
+//      after the 32 KiB written before it) for grey forms, where it still
+//      pays. The winner is screened by zlib at level 6: the cheap proxies
+//      mislead, because the signed sum and a level-1 deflate both favour
+//      small filtered values over the exact repetition an unfiltered row
+//      keeps and level 6 squeezes hardest.
 //   4. Deflate the winner with an optimal-parsing DEFLATE encoder written
 //      from RFC 1951 (hash-chain longest-match search, a Pareto frontier of
 //      (length, distance) records per position, and a shortest-path parse
 //      under iterated dynamic Huffman lengths), with the work budgeted by
-//      the filtered stream's size so the whole set fits the 60 s wall; a
-//      zlib level-9 stream is kept whenever it is smaller. Everything is
+//      the filtered stream's size and by how hard zlib level 9 already
+//      squeezed it, so the whole set fits the 60 s wall with margin: a
+//      stream zlib-9 already packs below 2% of its size keeps the zlib-9
+//      stream, the rest get the optimal parser with a shallow hash chain
+//      (128 for streams up to 1 MiB, 64 above) and one Huffman rebuild;
+//      a zlib level-9 stream is kept whenever it is smaller. Everything is
 //      deterministic: no clock, no environment, no randomness.
 //
 // Written from the DEFLATE (RFC 1951) and PNG specifications and the
@@ -307,7 +312,7 @@ function formsOf(rgba) {
   if (colours !== null) {
     for (const [order, filters] of [
       ['count', [0]],
-      ['luminance', [0, 'minsum', 'brute']],
+      ['luminance', [0, 'minsum']],
     ]) {
       const p = paletteForm(rgba, colours, order);
       forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, filters });
@@ -325,7 +330,7 @@ function formsOf(rgba) {
     if (key !== null) trns = Uint8Array.of(0, key >>> 16, 0, (key >>> 8) & 0xff, 0, key & 0xff);
   }
   const bpp = { 0: 1, 2: 3, 4: 2, 6: 4 }[ct];
-  forms.push({ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: [0, 'minsum', 'pairs', 'brute'] });
+  forms.push({ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: grey ? [0, 'minsum', 'pairs', 'brute'] : [0, 'minsum', 'pairs'] });
   return forms;
 }
 
@@ -641,6 +646,9 @@ function parseBlock(data, bs, be, matches, litLen, distLen, cost, choiceLen, cho
       cost[i + 1] = lc;
       choiceLen[i + 1] = 0;
     }
+    // No frontier record at this position means no match starts here:
+    // the symbol and exact-length loops below would find nothing.
+    if (pairLen[i] === 0) continue;
     // Pairs are ordered by increasing (length, distance), so for each length
     // symbol the first pair long enough for it has the smallest distance and
     // therefore the cheapest cost: one candidate per symbol, not pairs x 29.
@@ -872,25 +880,19 @@ function zlibBest(data) {
   }
   return best;
 }
-// The work is budgeted by the filtered stream's size, so the whole set fits
-// the wall: small streams get the deep chain, medium ones a shallow chain,
-// and the largest streams get zlib-9 first — optimal parsing only when the
-// stream still holds enough redundancy for it to pay (a large stream zlib-9
-// already squeezes hard has little left for it). The smaller of the two
-// streams is always kept.
+// The work is budgeted by the filtered stream's size and by how hard
+// zlib-9 already squeezed it, so the whole set fits the wall with margin:
+// a stream zlib-9 already packs below 2% of its size keeps the zlib-9
+// stream (the optimal parser would buy only a few percent for seconds of
+// work), and the rest get the optimal parser with a shallow hash chain
+// (128 for streams up to 1 MiB, 64 above) and a single Huffman rebuild.
+// The smaller of the two streams is always kept.
 function finalDeflate(data) {
   const z9 = zlibBest(data);
   const n = data.length;
-  if (n <= 1048576) {
-    const zl = zliteDeflate(data, { chain: 512, iterations: 2 });
-    return zl.length < z9.length ? zl : z9;
-  }
-  if (n <= 3145728) {
-    const zl = zliteDeflate(data, { chain: 256, iterations: 1 });
-    return zl.length < z9.length ? zl : z9;
-  }
   if (z9.length / n < 0.02) return z9;
-  const zl = zliteDeflate(data, { chain: 256, iterations: 1 });
+  const chain = n <= 1048576 ? 128 : 64;
+  const zl = zliteDeflate(data, { chain, iterations: 1 });
   return zl.length < z9.length ? zl : z9;
 }
 
